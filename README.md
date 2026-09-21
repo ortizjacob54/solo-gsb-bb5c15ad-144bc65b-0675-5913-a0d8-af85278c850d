@@ -14,7 +14,27 @@ docker compose up --build
 ```
 
 依赖在镜像构建时安装（`pip install -r requirements.txt`），SQLite 数据库在容器
-启动时自动建库建表，无需任何手工步骤。
+启动时自动建库建表，无需任何手工步骤。启动后访问 **http://localhost:8000/docs**
+即可看到包含全部接口的交互式文档。
+
+其它常用 Docker 操作：
+
+```bash
+# 后台运行
+docker compose up --build -d
+
+# 查看日志 / 停止
+docker compose logs -f
+docker compose down
+
+# 仅构建镜像
+docker build -t digest-api .
+docker run --rm -p 8000:8000 -v "$PWD/data:/app/data" digest-api
+
+# 在容器内运行测试套件
+docker build -t digest-api .
+docker run --rm digest-api sh -c "pip install --no-cache-dir pytest httpx && pytest"
+```
 
 ## 配置
 
@@ -44,6 +64,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/digests` | 提交序列与酶列表，执行酶切、保存并返回完整结果（201） |
 | `GET` | `/digests` | 列出全部提交的摘要（按 id 升序） |
 | `GET` | `/digests/{id}` | 按 id 查询保存的完整酶切结果（不存在返回 404） |
+| `POST` | `/digests/{id}/variant-analysis` | 对已保存记录施加一组单碱基替换并重跑酶切，返回切口与片段长度差异（不落库，记录不存在返回 404） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交示例
@@ -98,6 +119,73 @@ curl -X POST http://localhost:8000/digests \
 }
 ```
 
+## 变异影响分析
+
+对已保存的酶切记录施加一组 **0-based 单碱基替换**，在**内存中**用变异后序列
+重跑酶切（拓扑与酶列表沿用原记录），并与原结果逐项对比。**分析过程不写库**：
+原记录保持不变，也不会产生新的提交。
+
+### 请求
+
+```bash
+curl -X POST http://localhost:8000/digests/1/variant-analysis \
+  -H 'Content-Type: application/json' \
+  -d '{"variants": [{"position": 4, "alt": "C"}]}'
+```
+
+- `variants`：至少一个替换；每项 `position` 为 0-based 位置，`alt` 为单个
+  IUPAC 碱基（大小写均可，存储为大写）。
+- 允许同一碱基的"同义替换"（`alt` 与原碱基相同），此时差异全部为空。
+
+### 校验与状态码
+
+| 情形 | 状态码 |
+| --- | --- |
+| 记录不存在 | **404** |
+| `position` 越界（`>= 序列长度`，含上界） | **422** |
+| `position` 为负数 / `alt` 为非 IUPAC 碱基 | **422** |
+| 同一 `position` 重复出现 | **422** |
+| `variants` 为空列表 | **422** |
+
+### 响应与差异口径
+
+```json
+{
+  "id": 1,
+  "sequence_length": 14,
+  "variant_sequence": "AAAACAATTCTTTT",
+  "variants": [{"position": 4, "ref": "G", "alt": "C"}],
+  "cuts": {
+    "added": [],
+    "removed": [ {"top_cut": 5, "bottom_cut": 9, "...": "（完整切口对象）"} ],
+    "changed": []
+  },
+  "fragments": {
+    "before_lengths": [5, 9],
+    "after_lengths": [14],
+    "added": [],
+    "removed": [ {"start": 5, "...": "（完整片段对象）"} ],
+    "changed": [
+      {"start": 0, "before_length": 5, "after_length": 14, "length_delta": 9}
+    ]
+  }
+}
+```
+
+- **切口身份 = 物理坐标 `(top_cut, bottom_cut)`**：
+  - `added`：仅变异后存在的切口（**新增**）；
+  - `removed`：仅原结果存在的切口（**消失**）；
+  - `changed`：坐标相同、但末端或归属发生变化，`before` / `after` 为两个完整
+    切口对象，`changes` 列出变化字段（`end_type`、`overhang`、`enzymes`、
+    `sites` 的子集）——例如简并位点存活但突出端序列被替换改变；
+  - 切口"移动位置"（坐标/末端位置改变）表现为一条 `removed` 加一条 `added`。
+- **片段差异**：替换不改变序列长度，片段按骨架起点 `start` 配对。`changed`
+  给出起点相同片段的长度差异（`length_delta = after_length - before_length`）；
+  `added` / `removed` 为仅一侧存在的完整片段；`before_lengths` /
+  `after_lengths` 为物理顺序的片段长度清单，便于快速对比。
+- **稳定排序**：回显变异按 `position` 升序（与传入顺序无关）；切口差异按
+  `(top_cut, bottom_cut)` 排序；片段差异按 `start` 排序，相同请求结果必然一致。
+
 ## 结果字段约定
 
 - **坐标**：均为 0-based，作用于 top 链（提交序列方向）；切口位置 `c` 表示断裂
@@ -134,18 +222,32 @@ curl -X POST http://localhost:8000/digests \
 app/
 ├── main.py      # FastAPI 入口与路由
 ├── digest.py    # 酶切核心算法（搜索、去重、片段生成）
+├── variant.py   # 变异施加与切口/片段差异对比
 ├── iupac.py     # IUPAC 编码表与反向互补
 ├── schemas.py   # 请求/响应模型与校验
 └── db.py        # SQLite 持久化（启动时自动建表）
-tests/           # pytest 测试（算法 + API）
+tests/
+├── test_digest.py       # 酶切算法测试
+├── test_api.py          # 提交/查询/校验 API 测试
+└── test_variant_api.py  # 变异影响分析 API 测试
 Dockerfile
 docker-compose.yml
 requirements.txt
+requirements-dev.txt
 ```
 
 ## 运行测试
 
+本地运行：
+
 ```bash
 pip install -r requirements-dev.txt
 pytest
+```
+
+容器内运行（无需本地 Python 环境）：
+
+```bash
+docker build -t digest-api .
+docker run --rm digest-api sh -c "pip install --no-cache-dir -r requirements-dev.txt && pytest"
 ```

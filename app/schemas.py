@@ -75,6 +75,49 @@ class DigestRequest(BaseModel):
         return _check_iupac(v, "sequence")
 
 
+class VariantIn(BaseModel):
+    """一个 0-based 单碱基替换：将 position 处碱基替换为 alt。
+
+    position 上界依赖已保存记录的序列长度，因此越界检查在路由中
+    （取到记录之后）完成，以 422 拒绝；此处只做非负与碱基合法性校验。
+    """
+
+    position: int = Field(ge=0, examples=[4])
+    alt: str = Field(min_length=1, max_length=1, examples=["C"])
+
+    @field_validator("alt")
+    @classmethod
+    def _alt_ok(cls, v: str) -> str:
+        v = v.strip().upper()
+        if v not in VALID_BASES:
+            raise ValueError(
+                f"alt '{v}' is not an IUPAC base; allowed: ACGTRYSWKMBDHVN"
+            )
+        return v
+
+
+class VariantAnalysisRequest(BaseModel):
+    """变异影响分析请求：至少一个替换；同一位置重复出现即 422 拒绝。"""
+
+    variants: list[VariantIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _no_duplicate_positions(self) -> "VariantAnalysisRequest":
+        seen: set[int] = set()
+        duplicates: set[int] = set()
+        for v in self.variants:
+            if v.position in seen:
+                duplicates.add(v.position)
+            seen.add(v.position)
+        if duplicates:
+            raise ValueError(
+                "duplicate variant positions: "
+                + ", ".join(str(p) for p in sorted(duplicates))
+            )
+        return self
+
+
+
 class SiteOut(BaseModel):
     enzyme: str
     start: int
@@ -129,3 +172,53 @@ class DigestSummary(BaseModel):
     cut_count: int
     fragment_count: int
     created_at: str
+
+
+# ---------- 变异影响分析 ----------
+
+
+class AppliedVariantOut(BaseModel):
+    position: int
+    ref: str
+    alt: str
+
+
+class ChangedCutOut(BaseModel):
+    """坐标相同、但末端或归属酶/位点发生变化的切口。"""
+
+    before: CutOut
+    after: CutOut
+    changes: list[str]
+
+
+class CutDiffOut(BaseModel):
+    added: list[CutOut]
+    removed: list[CutOut]
+    changed: list[ChangedCutOut]
+
+
+class ChangedFragmentOut(BaseModel):
+    start: int
+    before_length: int
+    after_length: int
+    length_delta: int
+
+
+class FragmentDiffOut(BaseModel):
+    """片段长度差异：before/after_lengths 为物理顺序的片段长度清单。"""
+
+    before_lengths: list[int]
+    after_lengths: list[int]
+    added: list[FragmentOut]
+    removed: list[FragmentOut]
+    changed: list[ChangedFragmentOut]
+
+
+class VariantAnalysisResponse(BaseModel):
+    id: int
+    sequence_length: int
+    variant_sequence: str
+    variants: list[AppliedVariantOut]
+    cuts: CutDiffOut
+    fragments: FragmentDiffOut
+

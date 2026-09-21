@@ -1,10 +1,11 @@
 """FastAPI 应用入口。
 
 启动时（lifespan）自动完成数据库初始化；接口：
-    POST /digests        提交序列与酶列表，执行酶切并保存，返回完整结果
-    GET  /digests        列出全部提交的摘要
-    GET  /digests/{id}   按 id 查询保存的完整酶切结果
-    GET  /health         健康检查
+    POST /digests                          提交序列与酶列表，执行酶切并保存，返回完整结果
+    GET  /digests                          列出全部提交的摘要
+    GET  /digests/{id}                     按 id 查询保存的完整酶切结果
+    POST /digests/{id}/variant-analysis    基于已保存记录施加单碱基替换，重跑酶切并对比差异（不落库）
+    GET  /health                           健康检查
 """
 
 from __future__ import annotations
@@ -16,7 +17,15 @@ from fastapi import FastAPI, HTTPException
 
 from .db import Database
 from .digest import run_digest
-from .schemas import DigestRequest, DigestResponse, DigestSummary
+from .schemas import (
+    DigestRequest,
+    DigestResponse,
+    DigestSummary,
+    EnzymeIn,
+    VariantAnalysisRequest,
+    VariantAnalysisResponse,
+)
+from .variant import apply_substitutions, diff_cuts, diff_fragments, variant_summary
 
 db: Database
 
@@ -86,3 +95,44 @@ def get_digest(submission_id: int) -> dict:
     if record is None:
         raise HTTPException(status_code=404, detail=f"submission {submission_id} not found")
     return _build_response(record)
+
+
+@app.post(
+    "/digests/{submission_id}/variant-analysis",
+    response_model=VariantAnalysisResponse,
+)
+def analyze_variants(submission_id: int, request: VariantAnalysisRequest) -> dict:
+    # 先确认记录存在：不存在返回 404，且不泄露任何校验细节
+    record = db.get_submission(submission_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"submission {submission_id} not found")
+
+    sequence = record["sequence"]
+    length = len(sequence)
+    # 位置越界依赖记录的序列长度，只能在取到记录后校验 -> 422
+    out_of_bounds = sorted(
+        v.position for v in request.variants if v.position >= length
+    )
+    if out_of_bounds:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"variant positions out of bounds for sequence length {length}: "
+                + ", ".join(str(p) for p in out_of_bounds)
+            ),
+        )
+
+    # 仅在内存中施加替换并重跑酶切，原记录与数据库均不改动
+    enzymes = [EnzymeIn(**e) for e in record["enzymes"]]
+    variant_sequence = apply_substitutions(sequence, request.variants)
+    before = record["result"]
+    after = run_digest(variant_sequence, record["topology"], enzymes)
+
+    return {
+        "id": record["id"],
+        "sequence_length": length,
+        "variant_sequence": variant_sequence,
+        "variants": variant_summary(sequence, request.variants),
+        "cuts": diff_cuts(before["cuts"], after["cuts"]),
+        "fragments": diff_fragments(before["fragments"], after["fragments"]),
+    }
