@@ -129,3 +129,82 @@ class DigestSummary(BaseModel):
     cut_count: int
     fragment_count: int
     created_at: str
+
+
+class VariantIn(BaseModel):
+    """一个 0-based 单碱基替换：将 position 处的碱基替换为 base。"""
+
+    position: int = Field(ge=0, description="0-based 替换位置", examples=[9])
+    base: str = Field(description="替换后的碱基（IUPAC 单字符，大小写均可）", examples=["C"])
+
+    @field_validator("base")
+    @classmethod
+    def _base_ok(cls, v: str) -> str:
+        v = v.strip().upper()
+        if len(v) != 1 or v not in VALID_BASES:
+            raise ValueError(
+                f"variant base must be a single IUPAC base, got {v!r}; "
+                "allowed: ACGTRYSWKMBDHVN"
+            )
+        return v
+
+
+class VariantAnalysisRequest(BaseModel):
+    """变异影响分析请求：一组 0-based 单碱基替换，位置不得重复。"""
+
+    variants: list[VariantIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _positions_unique(self) -> "VariantAnalysisRequest":
+        seen: set[int] = set()
+        dups: set[int] = set()
+        for v in self.variants:
+            if v.position in seen:
+                dups.add(v.position)
+            seen.add(v.position)
+        if dups:
+            raise ValueError(
+                "duplicate variant positions: "
+                + ", ".join(str(p) for p in sorted(dups))
+            )
+        return self
+
+
+class VariantApplied(BaseModel):
+    position: int
+    ref_base: str
+    base: str
+
+
+class CutEndState(BaseModel):
+    end_type: Literal["blunt", "5prime", "3prime"]
+    overhang: str
+
+
+class ChangedCutOut(BaseModel):
+    """同一坐标切口在变异前后的末端特征变化。"""
+
+    top_cut: int
+    bottom_cut: int
+    changes: list[str]
+    before: CutEndState
+    after: CutEndState
+
+
+class FragmentLengthDiff(BaseModel):
+    baseline_lengths: list[int]
+    variant_lengths: list[int]
+    added_lengths: list[int]
+    removed_lengths: list[int]
+
+
+class VariantAnalysisResponse(BaseModel):
+    submission_id: int
+    topology: Literal["linear", "circular"]
+    sequence_length: int
+    variants_applied: list[VariantApplied]
+    mutated_sequence: str
+    added_cuts: list[CutOut]
+    removed_cuts: list[CutOut]
+    changed_cuts: list[ChangedCutOut]
+    fragment_lengths: FragmentLengthDiff

@@ -1,10 +1,11 @@
 """FastAPI 应用入口。
 
 启动时（lifespan）自动完成数据库初始化；接口：
-    POST /digests        提交序列与酶列表，执行酶切并保存，返回完整结果
-    GET  /digests        列出全部提交的摘要
-    GET  /digests/{id}   按 id 查询保存的完整酶切结果
-    GET  /health         健康检查
+    POST /digests                          提交序列与酶列表，执行酶切并保存，返回完整结果
+    GET  /digests                          列出全部提交的摘要
+    GET  /digests/{id}                     按 id 查询保存的完整酶切结果
+    POST /digests/{id}/variant-analysis    对已保存记录应用单碱基替换，对比酶切差异（不落库）
+    GET  /health                           健康检查
 """
 
 from __future__ import annotations
@@ -16,7 +17,15 @@ from fastapi import FastAPI, HTTPException
 
 from .db import Database
 from .digest import run_digest
-from .schemas import DigestRequest, DigestResponse, DigestSummary
+from .schemas import (
+    DigestRequest,
+    DigestResponse,
+    DigestSummary,
+    EnzymeIn,
+    VariantAnalysisRequest,
+    VariantAnalysisResponse,
+)
+from .variant import analyze_variants
 
 db: Database
 
@@ -86,3 +95,28 @@ def get_digest(submission_id: int) -> dict:
     if record is None:
         raise HTTPException(status_code=404, detail=f"submission {submission_id} not found")
     return _build_response(record)
+
+
+@app.post("/digests/{submission_id}/variant-analysis", response_model=VariantAnalysisResponse)
+def variant_analysis(submission_id: int, request: VariantAnalysisRequest) -> dict:
+    # 只读取已保存的记录，在内存中对突变序列重跑酶切——不写库，原记录不变。
+    record = db.get_submission(submission_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"submission {submission_id} not found")
+    sequence = record["sequence"]
+    length = len(sequence)
+    for v in request.variants:
+        if v.position >= length:
+            raise HTTPException(
+                status_code=422,
+                detail=f"variant position {v.position} out of bounds "
+                       f"for sequence of length {length}",
+            )
+    enzymes = [EnzymeIn(**e) for e in record["enzymes"]]
+    report = analyze_variants(sequence, record["topology"], enzymes, request.variants)
+    return {
+        "submission_id": submission_id,
+        "topology": record["topology"],
+        "sequence_length": length,
+        **report,
+    }
